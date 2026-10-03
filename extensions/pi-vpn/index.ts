@@ -564,7 +564,18 @@ async function copyGeoAssets(p: VpnPaths): Promise<string[]> {
     }
   }
   return copied;
-}// ------------------------------------------------------- process management
+}
+
+// --------------------------------------------- headless-safe notify (pi-web has no TUI)
+function safeNotify(ctx: ExtensionContext, msg: string, level: string = "info"): void {
+  try {
+    ctx.ui.notify(msg, level);
+  } catch {
+    // headless/server mode: no UI, tools still work
+  }
+}
+
+// ------------------------------------------------------- process management
 
 function controllerBase(settings: VpnSettings): string {
   return `http://${PI_CONTROLLER_HOST}:${settings.controllerPort}`;
@@ -1402,7 +1413,7 @@ pi.registerTool({
     description: "Show pi-vpn sidecar status (dedicated Mihomo for Pi)",
     handler: async (_args, ctx) => {
       const { settings, secret } = await ctxOf();
-      ctx.ui.notify(await statusCard(paths, settings, secret), "info");
+      safeNotify(ctx, await statusCard(paths, settings, secret), "info");
       await refreshStatusBar(ctx, paths, settings, secret);
     },
   });
@@ -1412,26 +1423,26 @@ pi.registerTool({
     handler: async (args, ctx) => {
       const { settings, secret } = await ctxOf();
       if (!args.trim()) {
-        ctx.ui.notify("Usage: /vpn-switch <keyword>  (e.g. /vpn-switch 台湾)", "warning");
+        safeNotify(ctx, "Usage: /vpn-switch <keyword>  (e.g. /vpn-switch 台湾)", "warning");
         return;
       }
       if (!(await isControllerAlive(paths, settings, secret))) {
-        ctx.ui.notify("sidecar not running; starting…", "info");
+        safeNotify(ctx, "sidecar not running; starting…", "info");
         const r = await ensureStarted(paths, settings, secret, "/vpn-switch");
         if (!r.alive) {
-          ctx.ui.notify(`start failed: ${r.note}`, "error");
+          safeNotify(ctx, `start failed: ${r.note}`, "error");
           return;
         }
       }
       const proxies = await apiJson<ProxiesResponse>(paths, settings, secret, "/proxies");
       const node = proxies.proxies["Proxy"];
       if (!node?.all) {
-        ctx.ui.notify("Proxy group not found", "error");
+        safeNotify(ctx, "Proxy group not found", "error");
         return;
       }
       const hits = findNodes(node.all, args, 8);
       if (hits.length === 0) {
-        ctx.ui.notify(`no node matches '${args}'`, "warning");
+        safeNotify(ctx, `no node matches '${args}'`, "warning");
         return;
       }
       const target = hits[0];
@@ -1439,7 +1450,7 @@ pi.registerTool({
       const delay = await delayTest(paths, settings, secret, target, settings.testUrl, settings.testTimeoutMs);
       const meta = await loadMeta(paths);
       await saveMeta(paths, { ...meta, selector: "Proxy", node: target });
-      ctx.ui.notify(`Proxy -> ${target} [${delay !== undefined ? `${delay}ms` : "timeout"}]`, "info");
+      safeNotify(ctx, `Proxy -> ${target} [${delay !== undefined ? `${delay}ms` : "timeout"}]`, "info");
       await refreshStatusBar(ctx, paths, settings, secret);
     },
   });
@@ -1459,7 +1470,7 @@ pi.registerTool({
         lines.push(`mode=${st.mode} node=${main.now} delay=${d !== undefined ? `${d}ms` : "TIMEOUT"}`);
       }
       lines.push(`egress env=${process.env.HTTP_PROXY ?? process.env.http_proxy ?? "(unset)"}`);
-      ctx.ui.notify(lines.join("\n"), alive ? "info" : "warning");
+      safeNotify(ctx, lines.join("\n"), alive ? "info" : "warning");
       await refreshStatusBar(ctx, paths, settings, secret);
     },
   });
@@ -1467,7 +1478,7 @@ pi.registerTool({
   pi.registerCommand("vpn-update", {
     description: "Re-import proxies from Clash Verge cache and restart sidecar",
     handler: async (_args, ctx) => {
-      ctx.ui.notify("re-importing proxies from Clash Verge cache…", "info");
+      safeNotify(ctx, "re-importing proxies from Clash Verge cache…", "info");
       const { settings, secret } = await ctxOf();
       const meta = await loadMeta(paths);
       let mode = "rule";
@@ -1481,12 +1492,12 @@ pi.registerTool({
         await writeFile(paths.configFile, built.configText, "utf-8");
         await writeFile(paths.goodConfigFile, built.configText, "utf-8");
       } catch (e) {
-        ctx.ui.notify(`vpn-update failed: ${(e as Error).message}`, "error");
+        safeNotify(ctx, `vpn-update failed: ${(e as Error).message}`, "error");
         return;
       }
       await stopSidecar(paths);
       const r = await ensureStarted(paths, settings, secret, "/vpn-update");
-      ctx.ui.notify(`vpn-update: ${r.note}`, r.alive ? "info" : "error");
+      safeNotify(ctx, `vpn-update: ${r.note}`, r.alive ? "info" : "error");
       await saveMeta(paths, { ...(await loadMeta(paths)), sourceFile: (await findVergeCacheFile()) ?? meta.sourceFile });
       await refreshStatusBar(ctx, paths, settings, secret);
     },
@@ -1503,25 +1514,25 @@ pi.registerTool({
     }
     const r = await ensureStarted(paths, settings, secret, "session_start");
     if (!r.alive) {
-      ctx.ui.notify(`pi-vpn: ${r.note} (continuing on system proxy :7890)`, "warning");
+      safeNotify(ctx, `pi-vpn: ${r.note} (continuing on system proxy :7890)`, "warning");
       setStatusBar(ctx, ctx.ui.theme.fg("dim", "VPN: off"));
       return;
     }
     if (settings.autoUse) {
       await setEgress(paths, "pi", settings);
     }
-    if (r.started) ctx.ui.notify(`pi-vpn sidecar started (${r.note})`, "info");
+    if (r.started) safeNotify(ctx, `pi-vpn sidecar started (${r.note})`, "info");
     if (r.alive && settings.autoUpdateOnStart) {
       try {
         const { sub: stSub } = await activeSub(paths);
         const ageH = stSub?.updatedAt ? (Date.now() - new Date(stSub.updatedAt).getTime()) / 3600000 : 1e9;
         if (stSub && ageH > settings.updateIntervalHours) {
-          ctx.ui.notify(`pi-vpn: subscription ${stSub.name} is ${subAge(stSub.updatedAt)} old, refreshing...`, "info");
+          safeNotify(ctx, `pi-vpn: subscription ${stSub.name} is ${subAge(stSub.updatedAt)} old, refreshing...`, "info");
           const rep = await refreshNodesFromActive(paths, settings, secret, "session_start-auto");
-          ctx.ui.notify(rep.slice(0, 600), r.alive ? "info" : "warning");
+          safeNotify(ctx, rep.slice(0, 600), r.alive ? "info" : "warning");
         }
       } catch (e) {
-        ctx.ui.notify(`pi-vpn auto-update skipped: ${(e as Error).message}`.slice(0, 300), "warning");
+        safeNotify(ctx, `pi-vpn auto-update skipped: ${(e as Error).message}`.slice(0, 300), "warning");
       }
     }
     await refreshStatusBar(ctx, paths, settings, secret);
