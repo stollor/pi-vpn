@@ -108,7 +108,7 @@ interface VpnSettings {
   autoStart: boolean;
   /** Switch process proxy env to the pi sidecar once it is healthy. */
   autoUse: boolean;
-  testUrl: string;  testTimeoutMs: number;  delayThresholdMs: number;  updateIntervalHours: number;  autoUpdateOnStart: boolean;}
+  testUrl: string;  testTimeoutMs: number;  delayThresholdMs: number;  updateIntervalHours: number;  autoUpdateOnStart: boolean;  directHosts: string[];  directProviders: string[];}
 
 const DEFAULT_SETTINGS: VpnSettings = {
   mixedPort: PI_MIXED_PORT,
@@ -118,7 +118,7 @@ const DEFAULT_SETTINGS: VpnSettings = {
   autoUse: true,
   testUrl: DEFAULT_TEST_URL,
   testTimeoutMs: 5000,
-  delayThresholdMs: 1500,  updateIntervalHours: 24,  autoUpdateOnStart: false,};
+  delayThresholdMs: 1500,  updateIntervalHours: 24,  autoUpdateOnStart: false,  directHosts: ["localhost", "127.0.0.1", "::1", ".xiaomimimo.com", ".deepseek.com"],  directProviders: ["xiaomi-token-plan-cn"],};
 
 async function loadSettings(p: VpnPaths): Promise<VpnSettings> {
   try {
@@ -127,6 +127,11 @@ async function loadSettings(p: VpnPaths): Promise<VpnSettings> {
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
+}
+
+async function saveSettings(p: VpnPaths, s: VpnSettings): Promise<void> {
+  await mkdir(p.runtimeDir, { recursive: true });
+  await writeFile(p.settingsFile, JSON.stringify(s, null, 2), "utf-8");
 }
 
 async function getSecret(p: VpnPaths): Promise<string> {
@@ -782,8 +787,9 @@ async function setEgress(p: VpnPaths, target: "pi" | "system", settings: VpnSett
   for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
     process.env[k] = url;
   }
-  process.env.NO_PROXY = "localhost,127.0.0.1,::1";
-  process.env.no_proxy = "localhost,127.0.0.1,::1";
+  const bypass = settings.directHosts.length > 0 ? settings.directHosts.join(",") : "localhost,127.0.0.1,::1";
+  process.env.NO_PROXY = bypass;
+  process.env.no_proxy = bypass;
   const meta = await loadMeta(p);
   await saveMeta(p, { ...meta, egress: target });
   await logLine(p, `egress -> ${target} (${url})`);
@@ -1208,7 +1214,17 @@ export default function (pi: ExtensionAPI) {
       } catch {
         lines.push("direct fetch (no proxy): FAILED — expected behind GFW, proxy is required");
       }
-      if (d === undefined || d > settings.delayThresholdMs) {
+      try {
+        const ctrl = new AbortController();
+        const tm = setTimeout(() => ctrl.abort(), 8000);
+        await fetch("https://token-plan-cn.xiaomimimo.com/", { signal: ctrl.signal });
+        clearTimeout(tm);
+        lines.push("domestic direct (token-plan-cn): REACHABLE without proxy");
+      } catch {
+        lines.push("domestic direct (token-plan-cn): UNREACHABLE directly - check local network");
+      }
+      if (st.mode !== "rule") lines.push(`WARNING: mode=${st.mode} disables GEOIP splitting - domestic models/endpoints may break. Prefer mode=rule.`);
+            if (d === undefined || d > settings.delayThresholdMs) {
         lines.push("Advice: run vpn_speedtest + vpn_switch to pick a faster node.");
       }
       return textResult(lines.join("\n"));
@@ -1370,6 +1386,32 @@ pi.registerTool({
       if (meta.subscriptionId === params.id) await saveMeta(paths, { ...meta, subscriptionId: undefined });
       await logLine(paths, `sub_remove ${params.id}`);
       return textResult(`removed ${params.id}.`);
+    },
+  });
+
+  pi.registerTool({
+    name: "vpn_direct",
+    description: "Manage domestic direct-access hosts (NO_PROXY): list, add or remove a host suffix (e.g. .example.com). Applies immediately to new child processes. Provider traffic follows Mihomo rule-mode GEOIP splitting; keep mode=rule so domestic stays direct.",
+    parameters: Type.Object({
+      action: Type.String({ description: "list, add or remove" }),
+      host: Type.Optional(Type.String({ description: "Host or suffix to add/remove, e.g. .example.com" })),
+    }),
+    async execute(_id, params) {
+      const { settings } = await ctxOf();
+      const paths = getPaths();
+      const a = params.action.toLowerCase();
+      if (a === "list") return textResult(`direct (NO_PROXY): ${settings.directHosts.join(", ")}
+direct providers: ${settings.directProviders.join(", ")}`);
+      const h = (params.host ?? "").trim();
+      if (!h) return textResult("provide {host} for add/remove.");
+      let hosts = [...settings.directHosts];
+      if (a === "add") { if (!hosts.includes(h)) hosts.push(h); }
+      else if (a === "remove") { hosts = hosts.filter((x) => x !== h); }
+      else return textResult("action must be list|add|remove.");
+      const next = { ...settings, directHosts: hosts };
+      await saveSettings(paths, next);
+      await setEgress(paths, ((await loadMeta(paths)).egress ?? "pi") as "pi" | "system", next);
+      return textResult(`direct hosts -> ${hosts.join(", ")}`);
     },
   });
 
@@ -1542,6 +1584,20 @@ pi.registerTool({
   // pid file) so Pi restarts and /reload do not drop connections. It is
   // stopped only via vpn_stop or /vpn … stop. No session_shutdown hook.
 
+  pi.on("model_select", async (event, ctx) => {
+    try {
+      const { settings, secret } = await ctxOf();
+      const id = `${event.model.provider}/${event.model.id}`;
+      const domestic = settings.directProviders.some((p) => id.startsWith(p));
+      if (!domestic) return;
+      if (!(await isControllerAlive(paths, settings, secret))) return;
+      const cfg = await apiJson<{ mode: string }>(paths, settings, secret, "/configs");
+      if (cfg.mode !== "rule") {
+        safeNotify(ctx, `pi-vpn: ${id} is a domestic-direct model but sidecar mode=${cfg.mode} (GEOIP splitting off) - switch back with vpn_mode rule if it fails.`, "warning");
+      }
+    } catch { /* advisory only */ }
+  });
+
   pi.on("before_agent_start", async (event) => {
     try {
       const { settings, secret } = await ctxOf();
@@ -1553,7 +1609,7 @@ pi.registerTool({
         "[pi-vpn] Dedicated egress: HTTP/SOCKS http://127.0.0.1:" +
           `${settings.mixedPort} (Mihomo ${st.version}, mode ${st.mode}, node ${main.now}).`,
         "Network tools: vpn_status/vpn_health/vpn_switch/vpn_speedtest/vpn_proxies/vpn_mode/vpn_use/vpn_update/vpn_reload. " +
-          `Config: ${paths.configFile} (guarded; vpn_reload applies edits). Never touch Clash Verge (:7890) unless the user asks. Subscriptions are self-managed: vpn_sub_add {url|fromVerge} stores+verifies, vpn_sub_list (masked), vpn_sub_use, vpn_sub_remove, vpn_update refreshes nodes. Never print a full subscription URL.`,
+          `Config: ${paths.configFile} (guarded; vpn_reload applies edits). Never touch Clash Verge (:7890) unless the user asks. Subscriptions are self-managed: vpn_sub_add {url|fromVerge} stores+verifies, vpn_sub_list (masked), vpn_sub_use, vpn_sub_remove, vpn_update refreshes nodes. Never print a full subscription URL. Domestic split: rule-mode sends GEOIP-CN direct automatically (both sidecar and Verge); child-process domestic hosts bypass via NO_PROXY (vpn_direct); warn before switching mode away from rule when a domestic model is active.`,
       ].join("\n");
       return { systemPrompt: `${event.systemPrompt}\n${extra}` };
     } catch {
