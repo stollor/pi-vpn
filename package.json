@@ -1,0 +1,12 @@
+{
+  "name": "pi-vpn",
+  "version": "1.1.0",
+  "description": "Pi-native independent VPN egress: a dedicated Mihomo sidecar with self-managed subscriptions.",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/pi-vpn/index.ts"
+    ]
+  }
+}
